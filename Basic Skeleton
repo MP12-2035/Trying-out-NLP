@@ -147,3 +147,39 @@ if __name__ == "__main__":
             break
         response = chat(user_input)
         print("Bot:", response)
+
+# -----------------------
+# Sample reverse dictionary for back-transliteration
+BACK_DICT = {
+    "kya": "kya",   # could also map to "kyaa"
+    "nahi": "nai",
+    "aap": "aap",
+    "aa": "aa",
+    "rahe": "rahe",
+    "ho": "ho",
+    # English words remain unchanged
+    "hello": "hello",
+    "are": "are",
+    "you": "you",
+}
+
+def back_transliterate(sentence, back_dict):
+    tokens = sentence.split()
+    back_tokens = [back_dict.get(t, t) for t in tokens]
+    return " ".join(back_tokens)
+
+# -------------------------
+
+def hinglishchat(prompt, max_length=50):
+    # 1. Normalize input
+    prompt_norm = normalize_sentence(clean_message(prompt), DICT)
+    inputs = tokenizer.encode(prompt_norm, return_tensors="pt")
+    
+    # 2. Generate response (normalized tokens)
+    outputs = model.generate(inputs, max_length=max_length, pad_token_id=tokenizer.eos_token_id)
+    response_norm = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    # 3. Back-transliterate to natural Hinglish
+    response_hinglish = back_transliterate(response_norm, BACK_DICT)
+    return response_hinglish
+
