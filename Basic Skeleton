@@ -1,36 +1,113 @@
-# Install dependencies:
-# pip install transformers datasets torch
+# Install dependencies if needed:
+# pip install transformers datasets torch pandas indic-transliteration
 
+import os
+import pandas as pd
+import re
 import torch
-from transformers import GPT2LMHeadModel, GPT2Tokenizer, TextDataset, DataCollatorForLanguageModeling, Trainer, TrainingArguments
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, Trainer, TrainingArguments, DataCollatorForLanguageModeling
+from indic_transliteration import sanscript
+from indic_transliteration.sanscript import transliterate
 
-# ---- Step 1: Load pre-trained GPT2 ----
-model_name = "distilgpt2"  # lighter GPT-2
+# ----------------------
+# 1. Load WhatsApp & Discord chats
+# ----------------------
+def load_whatsapp(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    messages = []
+    for line in lines:
+        if re.match(r'\d{1,2}/\d{1,2}/\d{4}', line):
+            msg = line.split(":", 1)[-1].strip()
+            if msg:
+                messages.append(msg)
+    return messages
+
+def load_discord(file_path):
+    df = pd.read_csv(file_path)
+    messages = df['content'].dropna().tolist()
+    return messages
+
+# ----------------------
+# 2. Clean messages
+# ----------------------
+def clean_message(msg):
+    msg = msg.lower()
+    msg = re.sub(r"http\S+", "", msg)  # remove links
+    msg = re.sub(r"[^a-zA-Z0-9\s]", "", msg)  # remove special chars
+    msg = re.sub(r"\s+", " ", msg).strip()
+    return msg
+
+whatsapp_msgs = load_whatsapp("whatsapp.txt")
+discord_msgs = load_discord("discord.csv")
+all_msgs = [clean_message(m) for m in (whatsapp_msgs + discord_msgs) if m.strip()]
+
+# ----------------------
+# 3. Transliteration + Dictionary Mapping
+# ----------------------
+# Sample bilingual dictionary
+DICT = {
+    # Hindi tokens
+    "क्या": "kya", "आप": "aap", "आ": "aa", "रहे": "rahe", "हो": "ho",
+    # English tokens
+    "hello": "hello", "how": "how", "are": "are", "you": "you",
+    # Common Hinglish shortcuts
+    "r": "are", "u": "you", "kyaa": "kya", "nai": "nahi", "bc": "bhai"
+}
+
+def normalize_token(token, dict_map):
+    # Transliterate to Devanagari
+    token_hi = transliterate(token, sanscript.ITRANS, sanscript.DEVANAGARI)
+    # Map to canonical token
+    if token in dict_map:
+        return dict_map[token]
+    elif token_hi in dict_map:
+        return dict_map[token_hi]
+    else:
+        return token
+
+def normalize_sentence(sentence, dict_map):
+    tokens = sentence.split()
+    normalized = [normalize_token(t, dict_map) for t in tokens]
+    return " ".join(normalized)
+
+normalized_msgs = [normalize_sentence(m, DICT) for m in all_msgs]
+
+# Save cleaned and normalized data
+with open("normalized_chat.txt", "w", encoding="utf-8") as f:
+    f.write("\n".join(normalized_msgs))
+
+# ----------------------
+# 4. Prepare dataset for GPT2
+# ----------------------
+from torch.utils.data import Dataset
+
+class ChatDataset(Dataset):
+    def __init__(self, tokenizer, file_path, block_size=128):
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.read().splitlines()
+        self.examples = []
+        for line in lines:
+            tokens = tokenizer.encode(line, add_special_tokens=True, max_length=block_size, truncation=True)
+            self.examples.append(torch.tensor(tokens))
+    def __len__(self):
+        return len(self.examples)
+    def __getitem__(self, idx):
+        return self.examples[idx]
+
+# ----------------------
+# 5. Load GPT2
+# ----------------------
+model_name = "distilgpt2"
 tokenizer = GPT2Tokenizer.from_pretrained(model_name)
 model = GPT2LMHeadModel.from_pretrained(model_name)
 
-# ---- Step 2: Prepare dataset ----
-def load_dataset(file_path, tokenizer, block_size=128):
-    from torch.utils.data import Dataset
-    class ChatDataset(Dataset):
-        def __init__(self, text_file):
-            with open(text_file, 'r', encoding='utf-8') as f:
-                self.lines = f.read().splitlines()
-            self.examples = []
-            for line in self.lines:
-                tokens = tokenizer.encode(line, add_special_tokens=True, max_length=block_size, truncation=True)
-                self.examples.append(torch.tensor(tokens))
-        def __len__(self):
-            return len(self.examples)
-        def __getitem__(self, i):
-            return self.examples[i]
-    return ChatDataset(file_path)
-
-dataset = load_dataset("your_chat.txt", tokenizer)
-
+dataset = ChatDataset(tokenizer, "normalized_chat.txt")
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-# ---- Step 3: Training setup ----
+# ----------------------
+# 6. Fine-tune GPT2
+# ----------------------
 training_args = TrainingArguments(
     output_dir="./chatbot_model",
     overwrite_output_dir=True,
@@ -48,18 +125,25 @@ trainer = Trainer(
     train_dataset=dataset
 )
 
-# ---- Step 4: Train ----
 trainer.train()
+trainer.save_model("./chatbot_model")
 
-# ---- Step 5: Generate responses ----
+# ----------------------
+# 7. Chat interface
+# ----------------------
 def chat(prompt, max_length=50):
-    inputs = tokenizer.encode(prompt, return_tensors="pt")
+    prompt_norm = normalize_sentence(clean_message(prompt), DICT)
+    inputs = tokenizer.encode(prompt_norm, return_tensors="pt")
     outputs = model.generate(inputs, max_length=max_length, pad_token_id=tokenizer.eos_token_id)
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return response
 
-while True:
-    user_input = input("You: ")
-    if user_input.lower() in ["exit", "quit"]:
-        break
-    response = chat(user_input)
-    print("Bot:", response)
+# Simple CLI
+if __name__ == "__main__":
+    print("Hinglish Chatbot (type 'exit' to quit)")
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() in ["exit", "quit"]:
+            break
+        response = chat(user_input)
+        print("Bot:", response)
